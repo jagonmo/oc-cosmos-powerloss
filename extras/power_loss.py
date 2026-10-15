@@ -46,10 +46,12 @@
 #                              choice in the prompt)
 # Both accept optional overrides:
 #   FILENAME=<file.gcode>   -- if the saved file path came back empty
-#   EXTRUDER_TEMP=<C> BED_TEMP=<C> -- if the saved temperatures are
-#                              missing/unusable. Without a usable nozzle
-#                              temperature (>= min_extrude_temp) the
-#                              resume refuses to start and nothing moves.
+#   EXTRUDER_TEMP=<C> BED_TEMP=<C> -- force the resume temperatures.
+#
+# Resume temperatures come from the gcode file itself: the last
+# PRINT_START EXTRUDER=/BED= or M104/M109/M140/M190 the slicer wrote
+# before the resume point. The heater targets saved at the outage are
+# only a fallback if the file can't be read.
 #
 # DELIBERATELY never declared here: BREAK_CONTROL_GPIO (203). That pin
 # enables the supercap's OUTPUT to the power rail -- touching it by
@@ -563,6 +565,93 @@ class PowerLoss:
 
         return last_e, absolute_extrude
 
+    # Temperature commands the slicer wrote into the file. COSMOS's slicer
+    # profile starts prints with "PRINT_START EXTRUDER=<t> BED=<t>"; mid-
+    # print temperature changes (e.g. first layer -> other layers) come as
+    # plain M104/M109/M140/M190. Matched only at the start of a line, so
+    # commented-out lines (";M104 ...") are ignored.
+    _TEMP_CMD_RE = re.compile(
+        rb'^[ \t]*(M104|M109|M140|M190)\b[^\n;]*?\b[SR](\d+(?:\.\d+)?)',
+        re.IGNORECASE | re.MULTILINE)
+    _PRINT_START_RE = re.compile(
+        rb'^[ \t]*(?:PRINT_START|START_PRINT)\b([^\n;]*)',
+        re.IGNORECASE | re.MULTILINE)
+    _PS_EXTRUDER_RE = re.compile(
+        rb'\b(?:EXTRUDER|EXTRUDER_TEMP|HOTEND|HOTEND_TEMP|NOZZLE|NOZZLE_TEMP)'
+        rb'=(\d+(?:\.\d+)?)', re.IGNORECASE)
+    _PS_BED_RE = re.compile(rb'\b(?:BED|BED_TEMP)=(\d+(?:\.\d+)?)',
+                            re.IGNORECASE)
+
+    def _derive_temps_from_file(self, file_path, file_position):
+        """The temperatures the slicer had set for this print at
+        file_position: the last PRINT_START / M104 / M109 / M140 / M190
+        found in the file before that point. Zero values (heater-off
+        commands) are ignored.
+
+        Unlike _derive_extrude_state_from_file this reads the WHOLE file
+        up to file_position, because a temperature change can be
+        anywhere (typically right after the first layer). It's done in
+        chunks with a C-level regex, and yields to the reactor between
+        chunks via reactor.pause() -- a single blocking pass over a large
+        file is exactly what once starved the MCU ("Timer too close").
+
+        Returns (extruder_temp, bed_temp); either may be None."""
+        if not file_path or file_position is None:
+            return None, None
+
+        CHUNK_BYTES = 262144
+        extruder = None
+        bed = None
+
+        def scan(buf):
+            nonlocal extruder, bed
+            # Collect (offset, kind, value) so commands of both forms are
+            # applied in file order -- the last one wins.
+            hits = []
+            for m in self._TEMP_CMD_RE.finditer(buf):
+                hits.append((m.start(), m.group(1).upper(),
+                             float(m.group(2))))
+            for m in self._PRINT_START_RE.finditer(buf):
+                args = m.group(1)
+                e = self._PS_EXTRUDER_RE.search(args)
+                b = self._PS_BED_RE.search(args)
+                if e:
+                    hits.append((m.start(), b"M104", float(e.group(1))))
+                if b:
+                    hits.append((m.start(), b"M140", float(b.group(1))))
+            hits.sort(key=lambda h: h[0])
+            for _, cmd, value in hits:
+                if value <= 0.0:
+                    continue
+                if cmd in (b"M104", b"M109"):
+                    extruder = value
+                else:
+                    bed = value
+
+        try:
+            with open(file_path, "rb") as f:
+                remaining = file_position
+                carry = b""
+                while remaining > 0:
+                    data = f.read(min(CHUNK_BYTES, remaining))
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    data = carry + data
+                    if remaining > 0:
+                        # Keep the partial last line for the next chunk.
+                        cut = data.rfind(b"\n") + 1
+                        carry = data[cut:]
+                        data = data[:cut]
+                    scan(data)
+                    self.reactor.pause(self.reactor.monotonic() + 0.001)
+        except OSError as e:
+            logging.error("power_loss: failed to read gcode file for "
+                           "temperatures: %s", e)
+            return None, None
+
+        return extruder, bed
+
     def _check_layer_change(self):
         try:
             print_stats = self.printer.lookup_object("print_stats")
@@ -803,49 +892,55 @@ class PowerLoss:
         except Exception:
             return 170.0
 
-    def _resolve_resume_temps(self, gcmd, full_state):
-        """Pick the temperatures to resume at, and refuse to resume at
-        all -- before anything moves -- if there's no usable nozzle
-        temperature. Order of preference for each heater:
+    def _resolve_resume_temps(self, gcmd, full_state, pkg):
+        """Pick the temperatures to resume at. Order of preference for
+        each heater (first usable value wins):
           1. EXTRUDER_TEMP= / BED_TEMP= passed to the resume command
-          2. the target captured at the instant of the outage
-          3. the target recorded at the last layer checkpoint
-        Returns (extruder_target, bed_target) as floats."""
+          2. the gcode file being printed: the last temperature the
+             slicer set before the resume point (_derive_temps_from_file)
+          3. the heater target captured at the instant of the outage
+          4. the heater target recorded at the last layer checkpoint
+        A nozzle value below min_extrude_temp is never "usable" (e.g. the
+        probing temperature COSMOS's PAUSE lowers to). Only if no source
+        at all yields one does the resume refuse to start -- before
+        anything moves. Returns (extruder_target, bed_target)."""
         min_extrude = self._min_extrude_temp()
         checkpoint = full_state.get("checkpoint") or {}
 
-        def pick(key, override_param):
+        gcmd.respond_info("power_loss: reading print temperatures from %s..."
+                          % pkg["file_path"])
+        file_ext, file_bed = self._derive_temps_from_file(
+            pkg["file_path"], pkg["file_position"])
+
+        def pick(override_param, file_value, key, minimum):
             override = gcmd.get_float(override_param, None, minval=0.0)
             if override is not None:
                 return override, override_param
-            for source_name, source in (("outage", full_state),
-                                        ("checkpoint", checkpoint)):
-                value = source.get(key)
-                if value:
+            candidates = (("gcode file", file_value),
+                          ("outage capture", full_state.get(key)),
+                          ("layer checkpoint", checkpoint.get(key)))
+            for source_name, value in candidates:
+                if value is not None and float(value) >= minimum \
+                        and float(value) > 0.0:
                     return float(value), source_name
             return 0.0, None
 
-        extruder_target, ext_src = pick("extruder_target", "EXTRUDER_TEMP")
-        # A target below min_extrude_temp at the outage (e.g. lowered by
-        # PAUSE) is not a print temperature; prefer the checkpoint's.
-        if (ext_src == "outage" and extruder_target < min_extrude
-                and float(checkpoint.get("extruder_target") or 0.0)
-                >= min_extrude):
-            extruder_target = float(checkpoint["extruder_target"])
-            ext_src = "checkpoint"
-        bed_target, bed_src = pick("heater_bed_target", "BED_TEMP")
+        extruder_target, ext_src = pick("EXTRUDER_TEMP", file_ext,
+                                        "extruder_target", min_extrude)
+        bed_target, bed_src = pick("BED_TEMP", file_bed,
+                                   "heater_bed_target", 0.0)
 
-        if extruder_target < min_extrude:
+        if ext_src is None:
             raise gcmd.error(
-                "power_loss: saved extruder temperature (%.0fC) is below "
-                "min_extrude_temp (%.0fC) -- refusing to resume, nothing "
-                "has moved. Re-run with the print temperatures, e.g. "
-                "POWER_LOSS_RESUME_SAFE EXTRUDER_TEMP=<temp> BED_TEMP=<temp>"
-                % (extruder_target, min_extrude))
+                "power_loss: no usable nozzle temperature found (gcode file "
+                "unreadable or without temperature commands, and no valid "
+                "saved value) -- refusing to resume, nothing has moved. "
+                "Re-run with the print temperatures: "
+                "POWER_LOSS_RESUME_SAFE EXTRUDER_TEMP=<temp> BED_TEMP=<temp>")
 
-        if bed_target <= 0.0:
+        if bed_src is None:
             gcmd.respond_info(
-                "power_loss: WARNING no saved bed temperature -- resuming "
+                "power_loss: WARNING no bed temperature found -- resuming "
                 "with the bed unheated. Pass BED_TEMP= if that's wrong.")
 
         gcmd.respond_info(
@@ -908,7 +1003,7 @@ class PowerLoss:
             )
 
         extruder_target, bed_target = self._resolve_resume_temps(
-            gcmd, full_state)
+            gcmd, full_state, pkg)
 
         gcmd.respond_info(
             "power_loss: resuming using '%s' position data "

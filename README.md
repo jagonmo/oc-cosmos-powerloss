@@ -130,14 +130,19 @@ Mainsail/Fluidd with three options. They can also be run manually:
 Both resume commands accept optional overrides:
 
 - `FILENAME=<file.gcode>` if the saved file path is empty.
-- `EXTRUDER_TEMP=<C>` and `BED_TEMP=<C>` if the saved temperatures are
-  missing or unusable.
+- `EXTRUDER_TEMP=<C>` and `BED_TEMP=<C>` to force the resume
+  temperatures.
 
 ### What the resume does
 
-1. Checks the saved temperatures. If there is no usable nozzle
-   temperature (at least `min_extrude_temp`), it stops with an error and
-   **nothing moves**.
+1. Reads the print temperatures from the G-code file being printed:
+   the last `PRINT_START EXTRUDER=… BED=…` or `M104`/`M109`/`M140`/`M190`
+   before the resume point, so per-layer temperature changes are
+   respected. If the file can't be read, it falls back to the heater
+   targets saved at the outage, then to those of the last completed
+   layer. Only if none of these gives a nozzle temperature of at least
+   `min_extrude_temp` does it stop with an error, before anything
+   moves.
 2. Starts heating bed and nozzle, and waits for the nozzle to reach
    `move_temp` before any movement.
 3. Lifts Z by `z_hop`, homes X and Y, and corrects Z for the
